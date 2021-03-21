@@ -4,15 +4,36 @@ import io
 import sys
 import signal
 import glob
+import logging
+import threading
+import time
+import asyncio
 
+realout = sys.stdout
 currentJob=None
 jobs = []
 bgResults = {}
+logging.basicConfig(format='%(message)s')
+logging.getLogger().setLevel(logging.INFO)
+
+def bghandler():
+    while True:
+        for i in jobs:
+            out,err = i[0].communicate()
+            poll = i[0].poll()
+            if poll is not None:
+                if i[2]:
+                    evalCommand(i[2],False,([out],i[3]))
+                elif i[3] == "":
+                    logging.info(out)
+                jobs.remove(i)
+
+
 
 def ctrlchandler(*a,**b):
     if currentJob != None:
         try:
-            os.kill(currentJob.pid,signal.SIGTERM)
+            os.kill(currentJob[0].pid,signal.SIGTERM)
         except Exception as err:
             print(err)
 
@@ -21,33 +42,45 @@ signal.signal(signal.SIGINT, ctrlchandler)
 def ctrlzhandler(*a,**b):
     if currentJob != None:
         try:
-            os.kill(currentJob.pid,signal.SIGTSTP)
+            os.kill(currentJob[0].pid,signal.SIGTSTP)
         except Exception as err:
             print(err)
 
 signal.signal(signal.SIGTSTP, ctrlzhandler)
+
 def main():
     exit = False
-
+    x = threading.Thread(target=bghandler, daemon=True)
+    x.start()
     while not exit:
         dir = subprocess.run(["pwd"],stdout=subprocess.PIPE,text=True)
         currentDir = dir.stdout[:-1]
         command = input(currentDir + "$")
         sys.stdout.flush()
         command = parseCommand(command)
-        printResults(evalCommand(command,False))
+        evalCommand(command,False,None)
 
-def evalCommand(command,subcom):
-    doReap()
+def evalCommand(command,subcom,prevIn):
+
     results = []
     infile = None
+    if prevIn:
+        if prevIn[1] == "|":
+            infile = prevIn[0]
+        if prevIn[1] == ">":
+            infile = writeFile(prevIn[0],getNext(command))
+    bg = False
+    if command and command[-1] == "&":
+        bg = True
     command = subCommandCheck(command)
     while command:
         current,type = getNext(command)
         if type == "<":
             infile = getFile(current)
         else:
-            result = evalResults(infile,current,type,subcom)
+            result = evalResults(infile,current,type,subcom,bg,command)
+            if bg:
+                break
             infile = None
         if type == "|":
             infile=result
@@ -66,8 +99,9 @@ def writeFile(result,command):
     return ""
 
 def printResults(result):
-    for i in result:
-        print(i,flush=True)
+    if result:
+        for i in result:
+            print(i,flush=True)
 
 def getNext(command):
     current = []
@@ -105,17 +139,17 @@ def subCommandCheck(command):
             for i in range(start,end+1):
                 output.pop(start)
             result = ""
-            for i in evalCommand(subcommand,True):
+            for i in evalCommand(subcommand,True,None):
                 result += str(i)
             result = result[:-1]
             output.insert(start,result)
         return output
 
-def evalResults(infile,command,type,subcom):
+def evalResults(infile,command,type,subcom,bg,whole):
     result=[]
     globList = doglob(command)
     for toRun in globList:
-        result.append(execCommand(infile,toRun,type,subcom))
+        result.append(execCommand(infile,toRun,type,subcom,bg,whole))
     return result
 
 def doglob(command):
@@ -133,11 +167,13 @@ def doglob(command):
         globList.append(command)
     return globList
 
-def execCommand(infile,command,type,subcom):
+def execCommand(infile,command,type,subcom,bg,whole):
+    global realout
     global currentJob
     toprint = False
     if type == "" and not subcom:
         toprint = True
+
     if command[0] == "cd":
         doCd(command)
         return ""
@@ -153,38 +189,41 @@ def execCommand(infile,command,type,subcom):
     elif command[0] == "exit":
         quit()
     else:
-        if not infile:
+        if infile == None:
             infile = [""]
+        if toprint:
+            outputter = realout
+        else:
+            outputter = subprocess.PIPE
+        output = []
         for i in infile:
             try:
-                if toprint:
-                    outputter = sys.stdout
-                    stdout = ""
-                else:
-                    outputter = subprocess.PIPE
-                if command[-1] != "&":
+                if not bg:
                     proc = subprocess.Popen(command,stdout=outputter,text=True,stdin=subprocess.PIPE,preexec_fn=os.setsid)
-                    proc.stdin.write(i)
-                    currentJob = proc
-                    jobs.append([proc,command[0]])
+                    if i:
+                        proc.stdin.write(i[0])
+                    currentJob = [proc,command[0],whole,type]
                     """while proc.poll is not None:
                         proc.stdin.write(input())
                         print(proc.stdout.readline())"""
                     stdout,stderr = proc.communicate()
                     currentJob=None
                     if toprint:
-                        return ""
+                        output.append("")
                     else:
-                        return stdout
+                        output.append(stdout)
                 else:
-                    proc = subprocess.Popen(command,stdout=outputter,text=True,stdin=subprocess.PIPE)
+                    if command[-1] == "&":
+                        command = command[:-1]
+                    proc = subprocess.Popen(command,stdout=subprocess.PIPE,text=True,stdin=subprocess.PIPE)
                     proc.stdin.write(i)
-                    jobs.append([proc,command[0]])
+                    jobs.append([proc,command[0],whole,type])
                     return ""
             except Exception as err:
-                print(err)
-                print ("Command Not Found")
+                logging.info(err)
+                logging.info ("Command Not Found")
                 return None
+        return output
 
 def makeSTDIN(input):
     f = io.StringIO(input)
@@ -218,14 +257,20 @@ def doFg(command):
         for i in jobs:
             if str(i[0].pid) == command[1]:
                 p = i[0]
+                currentJob = (p,i[2])
+                while p.poll() is not None:
+                    time.sleep(0.1)
                 jobs.remove(i)
-                currentJob = p
-                p.communicate()
+                if p[2]:
+                    evalCommand(p[2][:-1],False,(stdout,p[3]))
 
-def doReap():
-    for i in jobs:
-        if i[0].poll() != None:
-            jobs.remove(i)
+def doBg(command):
+        p = currentJob[0]
+        jobs.append(currentJob)
+        currentJob[0].send_signal(signal.SIGCONT)
+        currentJob[3].append("&")
+        currentJob=None
+
 
 if __name__ == "__main__":
     main()

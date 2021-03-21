@@ -1,4 +1,4 @@
 print("start test")
 name = input()
-print("ouput: " + name)
+print("output: " + name)
 print("end test")
